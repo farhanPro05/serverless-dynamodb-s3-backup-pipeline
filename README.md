@@ -234,3 +234,69 @@ Lambda #1 over 1 day: **2 invocations**, the first test and the second run from 
 7. **Deleted** the three lab IAM roles: both Lambda execution roles and the Scheduler role. None of them is in the roles list any more.
 
    ![IAM roles deleted; none of the lab roles remain](screenshots/32-cleanup-iam-roles-deleted.png)
+
+---
+
+## Answers to the report questions
+
+### 1. What is the difference between Lambda's execution role and Scheduler's execution role?
+
+They're used by different services for different jobs:
+
+- **Lambda's execution role** is assumed by the **Lambda service** while the function runs. Its permissions decide **what the function's code can do**. Boto3 picks up its temporary credentials automatically. Here, Lambda #1's role allows `dynamodb:PutItem`, Lambda #2's role allows `dynamodb:Scan` and `s3:PutObject`, and both can write logs.
+- **Scheduler's execution role** is assumed by **EventBridge Scheduler** when a schedule fires. Its permission decides **what Scheduler can start**: here, only `lambda:InvokeFunction` on `export-dynamodb-to-s3`. It gives no access to DynamoDB or S3.
+
+So the Scheduler role controls *who can start* Lambda #2, and Lambda #2's own role controls *what it may do* once it's running. Keeping them apart means Scheduler can't read the table or touch the bucket, and the function can't invoke other things.
+
+### 2. Why does running Lambda #1 twice not produce 20 DynamoDB users?
+
+`id` is the table's partition key, which makes it the item's unique identifier. `PutItem` writes a whole item: if an item with the same key already exists, it **replaces** it instead of adding a second one. The API returns the same 10 users with ids 1–10 every time. So the second run overwrote the 10 existing items with identical data, and the table still had 10 items. Screenshot 24 shows Lambda #1 was invoked twice. To keep every run's data, each write would need a different key, for example an extra sort key such as the import time.
+
+### 3. Why do Lambda #2 backups have unique timestamps and request IDs?
+
+Each export is written to its own key:
+
+```text
+backups/<UTC date>/users-<HH-MM-SS-microseconds>-<Lambda request ID>.json
+e.g. backups/2026-11-21/users-07-11-53-714932-99802b96-affe-40e0-86f2-ed9f385dba0c.json
+```
+
+- **No overwriting.** `PutObject` to an existing key replaces that object. A fresh key for every run means each export is kept as its own file, which is why the folder grew file by file (screenshot 21).
+- **Uniqueness, even at the same moment.** Two invocations in the same second, such as a manual test and a scheduled run, or a retry, still get different keys. The microseconds differ, and the request ID is unique per invocation.
+- **Traceability.** The request ID ties a file to its exact log lines. The file above matches `RequestId: 99802b96-…` in the CloudWatch log (screenshots 15 and 18).
+- **Ordering.** The date folder and the time make files easy to sort and find by when they were made. They're in UTC, so they don't depend on the viewer's time zone.
+
+### 4. What is the difference between `print()` logs and `Invocations`/`Errors` metrics?
+
+- **`print()` logs** are the function's own text output. Lambda sends whatever the code prints to **CloudWatch Logs**, one log stream per execution environment, together with the runtime's `START`, `END` and `REPORT` lines. They show **what happened inside a run**: `Saved user 3: Clementine Bauch`, `Read 10 items…`, or an `ERROR:` message with the reason.
+- **`Invocations` and `Errors`** are **CloudWatch Metrics**, numbers that Lambda publishes automatically without any code. `Invocations` counts how many times the function ran. `Errors` counts runs that ended in an unhandled exception. Duration, throttles and so on come the same way. They show **how often, how long, and whether it failed**, summed over time periods (screenshots 23 and 24).
+
+Metrics are for spotting a problem, such as errors going above 0 or a missing invocation. Logs are for finding out why. Details like the number of users are only in the logs, not in any metric. That's also why both functions re-raise exceptions after printing `ERROR:`. If they printed the error and returned normally, the run would still count as a success in the `Errors` metric.
+
+### 5. What would happen if you deleted the DynamoDB table but kept its JSON files in S3? Could the original indexes/configuration be automatically restored from the JSON alone?
+
+The **data** would survive: each JSON file holds every user's attributes as they were when the scan ran. But **nothing would be restored automatically**, and the table configuration would be lost:
+
+- Each JSON file is just an array of items. It has no table name, no key schema (`id` as a Number partition key), no capacity mode, secondary indexes, TTL, streams, PITR setting, encryption, tags, resource policy or alarms. None of that can be rebuilt from the JSON.
+- To get the data back, I'd have to create a new table by hand with the right key schema and settings, then write a script that reads a backup file and calls `PutItem` (or `BatchWriteItem`) for each user.
+- Even then it might not be an exact copy. The export turned DynamoDB numbers into plain JSON numbers, and any non-whole numbers into strings, so some types might not come back the same. Each file is also a `Scan`, not a consistent point-in-time snapshot of the table.
+
+In this lab the 7-day lifecycle rule would also delete those files after a week. Real restores should use DynamoDB's own backups (on-demand backup, PITR, or AWS Backup), which restore the table's data and its key schema and indexes.
+
+### 6. Why is an export every 2 minutes usually a poor production backup strategy for large DynamoDB tables?
+
+- **It reads the whole table every time.** A full `Scan` consumes read capacity for every item, 720 times a day, even if nothing has changed. That is slow and expensive for a big table, and it competes with the application's own reads.
+- **Lambda limits.** One invocation can run for at most 15 minutes, and this code keeps every item in memory to write a single file. A large table wouldn't fit in time or in memory.
+- **Not a consistent snapshot.** A scan reads pages over time while the table keeps changing, so a file can mix data from different moments. It doesn't capture configuration either (see question 5).
+- **Storage piles up.** That's about 30 files an hour, 720 a day, and over 21,000 a month, each a full copy of the table, with growing storage and request costs.
+- **Overlapping runs.** If one export takes longer than 2 minutes, the next one starts before it finishes, and duplicate scans run in parallel.
+- **Restoring is manual.** A custom script is needed, and nobody has tested it.
+
+Better options for production are **DynamoDB point-in-time recovery** (restore to any second in the last 35 days), **on-demand backups** or **AWS Backup**, and the managed **DynamoDB export to S3** (full or incremental, without using table read capacity). Choose the interval and retention from the workload's RPO and RTO.
+
+---
+
+## Notes
+
+- **UTC vs local time.** The folder date, the times in file names, and CloudWatch timestamps are in **UTC**. The S3 "Last modified" column and the console's other dates are in my local time, **UTC+6**. For example, `users-15-35-56-….json` shows as last modified at 21:35:57.
+- **The schedule is approximate.** `rate(2 minutes)` ran about every 2 minutes, give or take a second or so (15:33:56, 15:35:57, 15:37:56 …). That matches the assignment's note that a rate doesn't promise an exact second.
