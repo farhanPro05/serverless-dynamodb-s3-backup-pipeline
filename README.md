@@ -168,3 +168,69 @@ Each function's role allows only what its code calls, on only the resource it ne
 | Both | `AWSLambdaBasicExecutionRole-…` (logs) | To create their log group and stream and write `print()` output to CloudWatch. |
 
 Neither function can delete or change data it doesn't own. If Lambda #2's code had a bug, it still couldn't modify DynamoDB or delete earlier backups. The policy templates in `iam_policies/` keep `REGION`, `ACCOUNT_ID` and `YOUR_UNIQUE_BUCKET_NAME` as placeholders. I entered the real values only in the IAM console.
+
+---
+
+## Part D: a new export every 2 minutes with EventBridge Scheduler
+
+**Step 13. The schedule.** `dynamodb-backup-every-2min` is a recurring, rate-based schedule: `rate(2 minutes)`, with the flexible time window off. It was enabled at 21:03 local time (15:03 UTC).
+
+![Schedule dynamodb-backup-every-2min: Enabled, rate (2 minutes)](screenshots/19-scheduler-enabled-rate-2min.png)
+
+Its target is **AWS Lambda Invoke** on `export-dynamodb-to-s3` with the payload `{}`. The console created a separate **Scheduler execution role**, `Amazon_EventBridge_Scheduler_LAMBDA_…`, which is what allows Scheduler to invoke the function (see [question 1](#1-what-is-the-difference-between-lambdas-execution-role-and-schedulers-execution-role)).
+
+![Schedule target: export-dynamodb-to-s3, AWS Lambda Invoke, payload {}](screenshots/20-scheduler-target.png)
+
+**Step 14. Proof that it runs by itself.** I didn't press Test after creating the schedule. After a while, the date folder held 19 files: the 2 manual ones plus 17 from the schedule. Sorted by Last modified, the scheduled files are **exactly 2 minutes apart** (21:19:57, 21:21:57 … 21:35:57 local time).
+
+![S3 date folder with 19 files, sorted by Last modified, 2 minutes apart](screenshots/21-s3-scheduled-exports.png)
+
+Searching Lambda #2's logs for `SUCCESS` shows the same scheduled runs at 15:33:56, 15:35:57, 15:37:56 and 15:39:56 UTC, each exporting 10 users. The files they name (`users-15-33-56-…`, `users-15-35-56-…`) are the same files at the top of the S3 list above.
+
+![CloudWatch logs filtered by SUCCESS: scheduled runs 2 minutes apart](screenshots/22-lambda2-scheduled-logs.png)
+
+---
+
+## Part E: monitoring, retention and cleanup
+
+**Step 15. Metrics.** Lambda #2's Monitor tab over 3 hours: **23 invocations** from the schedule, a duration of about **460–610 ms** (average 502 ms), **0 errors** and a **100% success rate**.
+
+![Lambda #2 metrics: Invocations sum 23, Errors 0, success rate 100%](screenshots/23-lambda2-metrics.png)
+
+Lambda #1 over 1 day: **2 invocations**, the first test and the second run from Step 8. Both succeeded, with no errors.
+
+![Lambda #1 metrics: Invocations sum 2, Errors 0](screenshots/24-lambda1-metrics.png)
+
+**Step 16 (optional). Lifecycle rule.** `expire-demo-backups-after-7-days` applies only to the `backups/` prefix and expires backup files 7 days after they are created. That way a forgotten schedule can't fill the bucket for ever.
+
+![Lifecycle rule expire-demo-backups-after-7-days: prefix backups/, expire after 7 days](screenshots/25-s3-lifecycle-rule.png)
+
+**Step 19. Cleanup.** I deleted every lab resource, stopping the schedule first so no new files were written while I cleaned up.
+
+1. **Disabled** the schedule.
+
+   ![Schedule dynamodb-backup-every-2min shows Disabled](screenshots/26-scheduler-disabled.png)
+
+2. **Deleted** the schedule.
+
+   ![Schedule deleted, Schedules (0)](screenshots/27-cleanup-scheduler-deleted.png)
+
+3. **Emptied and deleted** the S3 bucket. A search for it now finds no match.
+
+   ![Bucket student-lambda-backups-9705 deleted](screenshots/28-cleanup-s3-bucket-deleted.png)
+
+4. **Deleted** both Lambda functions.
+
+   ![Both Lambda functions deleted, Functions (0)](screenshots/29-cleanup-lambdas-deleted.png)
+
+5. **Deleted** the DynamoDB table, without creating an on-demand backup.
+
+   ![DynamoDB table deleted, Tables (0)](screenshots/30-cleanup-dynamodb-deleted.png)
+
+6. **Deleted** the two lab log groups. Log groups stay behind after their functions are deleted, so they need deleting separately.
+
+   ![CloudWatch log groups deleted](screenshots/31-cleanup-log-groups-deleted.png)
+
+7. **Deleted** the three lab IAM roles: both Lambda execution roles and the Scheduler role. None of them is in the roles list any more.
+
+   ![IAM roles deleted; none of the lab roles remain](screenshots/32-cleanup-iam-roles-deleted.png)
