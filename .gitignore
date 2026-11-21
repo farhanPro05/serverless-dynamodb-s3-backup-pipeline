@@ -1,0 +1,19 @@
+# Personal working guide (not part of the submission)
+GUIDE.md
+
+# macOS / editor junk
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets: never commit these
+.env
+.env.*
+.aws/
+credentials
+*.pem
+*.key
